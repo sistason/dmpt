@@ -3,14 +3,14 @@
 import time
 import fcntl, struct
 import socket
-import asyncore
+import asyncore, sys
 import logging
 
 from pytap import TapDevice
 import netifaces
 
 import re
-re_ip4 = re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
+regex_ipv4 = re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
 def get_ip_address(ifname, if_socket):
     try:
         return socket.inet_ntoa(fcntl.ioctl(
@@ -48,11 +48,15 @@ class Loadbalancer(asyncore.dispatcher_with_send):
         """ Empty buffer and close """
         self.out_buffer = ''
         self.close()
-        self.control.loadbalancer_pool.remove(self)
+        if self in self.control.loadbalancer_pool:
+            self.control.loadbalancer_pool.remove(self)
         logging.info('{} Closed'.format(repr(self)))
 
     def __repr__(self):
-        return 'Loadbalancer:{}'.format(self.socket.gethostname()[-1]) if self.socket else 'Loadbalancer:<unbound>'
+        try:
+            return 'Loadbalancer:{}'.format(self.socket.getsockname()[-1])
+        except:
+            return 'Loadbalancer:<unbound>'
 
 class LoadbalancerServer(Loadbalancer):
     def handle_read(self):
@@ -88,28 +92,42 @@ class LoadbalancerClient(Loadbalancer):
         """ Parse interface_spec and make socket accordingly. Then bind and connect """
 
         # Test if there is an interface with that name
-        ip = get_ip_address(interface_spec, self.socket)
-        if ':' in interface_spec and ip is None:
+        interfaces = netifaces.interfaces()
+        if ':' in interface_spec and interface_spec not in interfaces:
             # So either ipv6 or interface/ipv4/ipv6:port
             try:
                 socket.inet_pton(socket.AF_INET6, interface_spec)
-                ip_addr, port = itnerface_spec, 0
-            except:
+                ip_addr, port = interface_spec, 0
+            except socket.error:
                 # not ipv6, so interface/ipv4/ipv6:port
                 interface_name, port = interface_spec.split(':')
+                port = int(port)
                 try:
                     socket.inet_pton(socket.AF_INET6, interface_name)
                     ip_addr = interface_name
-                except:
+                except socket.error:
                     # not ipv6, so ipv4 or interface-name
                     if re.match(regex_ipv4, interface_name):
                         ip_addr = interface_name
                     else:
                         ip_addr = get_ip_address(interface_name, self.socket)
         else:
-            # ':' is either not there or it is a subinterface/strange-name
-            ip_addr, port = ip, 0
-
+            # ':' is not there or it is a subinterface/strange-name
+            port = 0
+            if re.match(regex_ipv4, interface_spec):
+                ip = interface_spec
+            else:
+                if_ = netifaces.ifaddresses(interface_spec)
+                # Find first address we can find (either v4 or v6)
+                for addr_family,addrs in if_.items():
+                    for addr in addrs:
+                        if 'addr' in addr:
+                            ip_addr = addr['addr']
+                            break
+                else:
+                    logging.error('Cannot bind to specified interface "{}", has no address!'.format(interface_spec))
+                    raise socket.error()
+                        
         try:
             socket.inet_pton(socket.AF_INET6, ip_addr)
             sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -117,31 +135,24 @@ class LoadbalancerClient(Loadbalancer):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         self.set_socket(sock)
-
         self.loadbalancer_bind((ip_addr, port))
-        # Trigger connect for authorization
-        self.handle_connect_event()
 
-    def loadbalancer_bind(self, interface_spec):
+        # Connect and authorize
+        self.connect((self.control.destination, self.control.port))
+
+    def loadbalancer_bind(self, addr):
         """ bind to the interface and the specified port (or random) """
 
         try:
-            self.bind((ip_addr, port))
-            logging.debug('Bound to {}:{}'.format(ip_addr, port))
+            self.bind(addr)
+            logging.debug('Bound to {}:{}'.format(*addr))
         except IOError as e:
-            logging.exception('Exception when binding loadbalancer to {}:{}: {}'.format(interface_name, port, e.strerror))
+            logging.exception('Exception when binding loadbalancer to {}: {}'.format(repr(addr), e.strerror))
             return
 
     def handle_connect(self):
-        """ Connect and authorize afterwards"""
-        if self.control.shutdown:
-            return
-        try:
-            self.connect((self.control.destination, self.control.port))
-            self.authorize()
-        except socket.error as e:
-            logging.error('Error while connecting to {}:{}: {}'.format(self.control.destination, self.control.port, e.strerror))
-            time.sleep(1)
+        """ Authorize afterwards"""
+        self.authorize()
 
 
 class LoadbalancerControl(asyncore.file_dispatcher):
@@ -218,7 +229,7 @@ class LoadbalancerControl(asyncore.file_dispatcher):
     def balance_data_round_robin(self, packet):
         """ Use Round Robin to distribute each packet via revolving loadbalancers """
         if len(self.loadbalancer_pool) == 0:
-            return
+            sys.exit(0)
         
         logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancer_pool[self.rr])))
         self.loadbalancer_pool[self.rr].send(packet)

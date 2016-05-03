@@ -26,5 +26,7 @@ Dependencies
 Usage
 =====
 Start as server on your endpoint and as client on your startpoint, with as many paths as needed.
+
 Paths can be specified on the client as interfaces/IP-addresses plus optionally ports, where the tcp-connections to the server bind to. That way, the routing will use different paths for the traffic.
+
 The example shell script shows how to do that based on source-ports.
