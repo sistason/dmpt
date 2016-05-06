@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-
+# -*- encoding: utf-8 -*-
 import time
-import fcntl, struct
+import struct
 import socket
 import asyncore, sys
 import logging
@@ -11,27 +11,44 @@ import netifaces
 
 import re
 regex_ipv4 = re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
-def get_ip_address(ifname, if_socket):
-    try:
-        return socket.inet_ntoa(fcntl.ioctl(
-            if_socket.fileno(),
-            0x8915,  # SIOCGIFADDR
-            struct.pack('256s', ifname[:15])
-        )[20:24])
-    except:
-        return None
 
-class Loadbalancer(asyncore.dispatcher_with_send):
+class Loadbalancer(asyncore.dispatcher):
+    out_buffer = []
+
     def __init__(self, sock, control):
-        asyncore.dispatcher_with_send.__init__(self, sock)
+        asyncore.dispatcher.__init__(self, sock)
+        if self.socket:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
+#            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+            self.set_reuse_addr()
         self.control = control
         self.port = control.port
+
+    def initiate_send(self):
+        packet = self.out_buffer.pop() if len(self.out_buffer) else ''
+        logging.debug('Sending {}b packet  to  loadbalancing'.format(len(packet)))
+        while len(packet) > 0:
+            num_sent = asyncore.dispatcher.send(self, packet)
+            logging.debug('\t {}b sent'.format(num_sent))
+            if num_sent == 0:
+                break
+            packet = packet[num_sent:]
+
+    def writable(self):
+        return (not self.connected) or len(self.out_buffer)
 
     def handle_read(self):
         """ Everything read goes into the device """
         data = self.recv(8192)
         if data:
+            logging.debug('Reading {}b packet from loadbalancing'.format(len(data)))
             self.control.write(data)
+
+    def send(self, data):
+        logging.debug('\tAdding {}b packet  to  buffer'.format(len(data)))
+        self.out_buffer.append(data)
+        self.initiate_send()
+
 
 # NOTE: dispatcher already connects before send, when disconnected, right?
 #    def send(self, data):
@@ -46,7 +63,7 @@ class Loadbalancer(asyncore.dispatcher_with_send):
 
     def handle_close(self):
         """ Empty buffer and close """
-        self.out_buffer = ''
+        self.out_buffer = []
         self.close()
         if self in self.control.loadbalancer_pool:
             self.control.loadbalancer_pool.remove(self)
@@ -54,7 +71,7 @@ class Loadbalancer(asyncore.dispatcher_with_send):
 
     def __repr__(self):
         try:
-            return 'Loadbalancer:{}'.format(self.socket.getsockname()[-1])
+            return 'Loadbalancer:{}'.format(self.addr[-1])
         except:
             return 'Loadbalancer:<unbound>'
 
@@ -67,12 +84,10 @@ class LoadbalancerServer(Loadbalancer):
 
     def authorize(self, data):
         """ Do authentication """
-        print 'gotten data for auth: "{}"'.format(data)
         if data[:len(self.control.secret)] != self.control.secret:
             self.send('403 unauthorized!')
             self.close()
             return
-        print 'Auth successfull!'
         # If auth is successfull, replace with the normal read func
         self.handle_read = lambda: Loadbalancer.handle_read(self)
         return data[len(self.control.secret):]
@@ -80,16 +95,16 @@ class LoadbalancerServer(Loadbalancer):
 
 class LoadbalancerClient(Loadbalancer):
     def __init__(self, control, interface_spec):
-        Loadbalancer.__init__(self, None, control)
-
-        self.setup(interface_spec)
+        sock = self.parse_interface_spec(interface_spec)
+        Loadbalancer.__init__(self, sock, control)
+        self.setup()
 
     def authorize(self):
         """ Do authentication """
         self.send(self.control.secret)
 
-    def setup(self, interface_spec):
-        """ Parse interface_spec and make socket accordingly. Then bind and connect """
+    def parse_interface_spec(self, interface_spec):
+        """ Parse interface_spec and make socket accordingly. """
 
         # Test if there is an interface with that name
         interfaces = netifaces.interfaces()
@@ -134,20 +149,25 @@ class LoadbalancerClient(Loadbalancer):
         except:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-        self.set_socket(sock)
-        self.loadbalancer_bind((ip_addr, port))
+        self._addr = (ip_addr, port)
 
+        return sock
+
+    def setup(self):
+        """ Bind and connect """
+
+        self.loadbalancer_bind()
         # Connect and authorize
         self.connect((self.control.destination, self.control.port))
 
-    def loadbalancer_bind(self, addr):
+    def loadbalancer_bind(self):
         """ bind to the interface and the specified port (or random) """
 
         try:
-            self.bind(addr)
-            logging.debug('Bound to {}:{}'.format(*addr))
+            self.bind(self._addr)
+            logging.debug('Bound to {}:{}'.format(*self.addr))
         except IOError as e:
-            logging.exception('Exception when binding loadbalancer to {}: {}'.format(repr(addr), e.strerror))
+            logging.exception('Exception when binding loadbalancer to {}: |{}|'.format(repr(self._addr), e.strerror))
             return
 
     def handle_connect(self):
@@ -172,6 +192,8 @@ class LoadbalancerControl(asyncore.file_dispatcher):
         asyncore.file_dispatcher.__init__(self, self.dev.getFD())
 
         self.dev.up()
+        if options.get('tunnel_address', False):
+            self.dev.ifconfig(address=options.get('tunnel_address'))
 
         logging.debug('Interface ready')
 
@@ -208,17 +230,23 @@ class LoadbalancerControl(asyncore.file_dispatcher):
         """ Write local buffer to interface """
         try:
             packet = self.buffer.pop()
-            logging.debug('Writing data to device: {}'.format(packet))
+            logging.debug('Writing {}byte packet to device'.format(len(packet)))
             self.dev.write(packet)
         except IndexError:
             pass
+        except OSError as e:
+            if e.errno == 22:
+                # Invalid packet
+                logging.debug('Failed to write invalid packet "{}"'.format(packet))
+            else:
+                logging.exception('Writing "{}" to device caused exception: {}'.format(packet, e.strerror))
         except Exception as e:
             logging.exception('Writing "{}" to device caused exception: {}'.format(packet, e.strerror))
 
     def write(self, packet):
         """ Forward data from loadbalancers to local buffer """
         if packet:
-            self.validate(packet)
+#            self.validate(packet)
             self.buffer.append(packet)
 
     def handle_read_event(self):
@@ -229,9 +257,9 @@ class LoadbalancerControl(asyncore.file_dispatcher):
     def balance_data_round_robin(self, packet):
         """ Use Round Robin to distribute each packet via revolving loadbalancers """
         if len(self.loadbalancer_pool) == 0:
-            sys.exit(0)
+            return
         
-        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancer_pool[self.rr])))
+#        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancer_pool[self.rr])))
         self.loadbalancer_pool[self.rr].send(packet)
         self.rr = self.rr+1 if self.rr < len(self.loadbalancer_pool)-1 else 0
 
@@ -316,14 +344,15 @@ if __name__ == '__main__':
     argparser.add_argument('--secret','-s',  help='Set a passphrase to authenticate connecting clients. Will stop accidental usage by other programs, but is transmitted trivially in the clear, so don\'t think it does security.')
     argparser.add_argument('--name', '-n',  help='Name of the tap/tun device', default='')
     argparser.add_argument('--tun', '-t',  type=bool, help='Use a tun device instead of a tap device', default=False)
+    argparser.add_argument('--address', '-a', help='Address of the tun/tap device')
 
     p=vars(argparser.parse_args())
     
     destination = p['remote']
     interfaces = p['interfaces']
-    options = {'port':p['port'], 'secret':p['secret'], 'name':p['name'], 'tap':not p['tun']}
+    options = {'port':p['port'], 'secret':p['secret'], 'name':p['name'], 'tap':not p['tun'], 'tunnel_address':p['address']}
 
-    logging.basicConfig(format='%(levelname)s:%(funcName)s\t\t%(message)s', level=logging.DEBUG)
+    logging.basicConfig(format='%(levelname)s:%(funcName)s\t\t%(message)s', level=logging.INFO)
 
     if destination:
         loadbalancer = LoadbalancerClientControl(destination, interfaces, options)
