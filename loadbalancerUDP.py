@@ -12,30 +12,55 @@ import netifaces
 import re
 regex_ipv4 = re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$')
 
+class resettableTimer():
+    """ A class implementing a timer, checking for timeout every n seconds
+
+    Sadly, python does not provide a timer which is resettable, so here
+    is an implementation for that"""
+    check_interval = 1
+
+    def __init__(self, timeout, timeout_function, timeout_function_args=()):
+        self._timeout = timeout
+        self._timeout_function = lambda: timeout_function(*timeout_function_args)
+
+        self._timeout_time = time.time()
+        self._timer = threading.Timer(self.check_interval, self._check_function)
+        self._timer.start()
+
+    def _check_function(self):
+        """ Check every 1 second if we have a read timeout """
+        if (time.time() - self._timeout_time) > self._timeout:
+            logging.debug('Timeout!')
+            self._timeout_function()
+        else:
+            self._timer = threading.Timer(self.check_interval, self._check_function)
+            self._timer.start()
+
+    def reset(self):
+        self._timeout_time = time.time()
+
+    def stop(self):
+        self._timer.cancel()
+        
+    def is_running(self):
+        return self._timer.is_alive()
+
 class dispatcher_with_addr(asyncore.dispatcher):
+    """ Basically asyncore.dispatcher, with recvfrom and sendto and respective buffering
+
+    recvfrom is only used by the server to dynamically adapt to new loadbalancer-clients
+    sendto is used by both, since it's udp"""
     out_buffer = []
 
     def __init__(self, sock, control):
         asyncore.dispatcher.__init__(self, sock)
         if self.socket:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
             self.set_reuse_addr()
 
         self.control = control
         self.port = control.port
-
-        self.timeout = 30
-        self.timeout_time = time.time()
-        self.timer_timeout = threading.Timer(1, self.check_timeout)
-        self.timer_timeout.start()
-
-    def check_timeout(self):
-        """ Check every 1 second if we have a read timeout """
-        if (time.time() - self.timeout_time) > self.timeout:
-            self.timeout_close()
-        else:
-            self.timer_timeout = threading.Timer(1, self.check_timeout)
-            self.timer_timeout.start()
 
     def timeout_close(self):
         logging.info('{} exited due to not receiving data for {} seconds'.format(repr(self), self.timeout))
@@ -55,17 +80,8 @@ class dispatcher_with_addr(asyncore.dispatcher):
                 break
             packet = packet[num_sent:]
 
-    def handle_read(self):
-        """ Read a datagram and write to the tun/tap device """
-        data = self.recv(8192)
-        if data:
-            logging.debug('Reading {}b packet from loadbalancing'.format(len(data)))
-            self.timeout_time = time.time()
-            self.control.write(data)
-
     def send(self, data, addr):
         """ Append to buffer and start sending """ 
-        logging.debug('\tAdding {}b packet  to  buffer'.format(len(data)))
         self.out_buffer.append((data, addr))
         self.initiate_send()
 
@@ -83,6 +99,14 @@ class dispatcher_with_addr(asyncore.dispatcher):
             else:
                 raise
 
+    def handle_read(self):
+        """ Read a datagram and write to the tun/tap device """
+        data = self.recv(8192)
+        if data:
+            logging.debug('Reading {}b packet from loadbalancing'.format(len(data)))
+            self.timer.reset()
+            self.control.write(data)
+ 
     def recvfrom(self, buffer_size):
         """ Wrapper for exceptions around recvfrom """
         try:
@@ -101,14 +125,6 @@ class dispatcher_with_addr(asyncore.dispatcher):
                 return '', ()
             else:
                 raise
-
-    def handle_close(self):
-        """ Empty buffer, close and remove from pool """
-        self.out_buffer = []
-        self.close()
-        if self in self.control.loadbalancer_pool:
-            self.control.loadbalancer_pool.remove(self)
-        logging.info('{} Closed'.format(repr(self)))
 
     def __repr__(self):
         try:
@@ -131,6 +147,7 @@ class LoadbalancerClient(dispatcher_with_addr):
 
         self.loadbalancer_bind()
         self.send_configs()
+        self.timer = resettableTimer(30, self.handle_close)
 
     def send_configs(self):
         """ Send auth and configuration """
@@ -144,8 +161,9 @@ class LoadbalancerClient(dispatcher_with_addr):
             [interface|IPaddress(v4/v6)][:src-port][$downlink:uplink]
             The interface/IP/port are used for binding the socket and determining
             the protocol-version of the socket.
-            The uplink/downlink are saved and the downlink gets transmitted to the server,
-            the uplink gets used by the LoadbalancerClientControl for weighted balancing
+            The uplink/downlink are saved and the downlink gets transmitted to the
+            server, the uplink gets used by the LoadbalancerClientControl for 
+            weighted balancing
         """
 
         if '$' in routing_spec:
@@ -157,6 +175,7 @@ class LoadbalancerClient(dispatcher_with_addr):
                 logging.exception('Error parsing weight specifications "{}": {}'.format(weights, e.strerror))
         else:
             self.weight_downlink, self.weight_uplink = 1,1
+
 
         # Test if there is an interface with that name
         interfaces = netifaces.interfaces()
@@ -182,7 +201,7 @@ class LoadbalancerClient(dispatcher_with_addr):
             # ':' is not there or it is a subinterface/strange-name
             port = 0
             if re.match(regex_ipv4, routing_spec):
-                ip = routing_spec
+                ip_addr = routing_spec
             else:
                 if_ = netifaces.ifaddresses(routing_spec)
                 # Find first address we can find (either v4 or v6)
@@ -214,6 +233,15 @@ class LoadbalancerClient(dispatcher_with_addr):
         except IOError as e:
             logging.exception('Exception when binding loadbalancer to {}: |{}|'.format(repr(self._addr), e.strerror))
             return
+        
+    def handle_close(self):
+        """ Empty buffer, close and remove from pool """
+        self.out_buffer = []
+        self.close()
+        self.timer.stop()
+        if self in self.control.loadbalancing_pool:
+            self.control.loadbalancing_pool.remove(self)
+        logging.info('{} Closed'.format(repr(self)))
 
 class LoadbalancerServer(dispatcher_with_addr):
     """ Helper class to spawn server-loadbalancers for connecting client-loadbalancers """
@@ -231,15 +259,28 @@ class LoadbalancerServer(dispatcher_with_addr):
 
         If the source of the data is unknown, create a Client for it, if authorization succeeds"""
         data, addr = self.recvfrom(8192)
-        if data:
-            if addr not in self.control.loadbalancer_pool_addrs:
-                logging.info('New client incoming from {}'.format(repr(addr)))
-                lb_server = Client(addr, data, self.control)
-                if lb_server.authorized:
-                    self.control.loadbalancer_pool.append(lb_server)
-                    self.control.loadbalancer_pool_addrs.append(addr)
-            else:
+        if not data:
+            return
+        
+        # write to device and return, if the source-addr is already known
+        for item in self.control.loadbalancing_pool:
+            if item.addr == addr:
+                logging.debug('Reading {}b packet from {}'.format(len(data), repr(addr)))
+                item.timer.reset()
                 self.control.write(data)
+                return
+    
+        logging.info('New client incoming from {}'.format(repr(addr)))
+        new_client = Client(addr, data, self.control)
+        if new_client.authorized:
+            logging.info('\tAuth successfull from {}'.format(repr(addr)))
+            self.control.loadbalancing_pool.append(new_client)
+    
+    def handle_close(self):
+        """ Empty buffer, close and remove from pool """
+        self.out_buffer = []
+        self.close()
+        logging.info('{} Closed'.format(repr(self)))
 
 
 class Client():
@@ -250,24 +291,28 @@ class Client():
         self.addr = addr
         self.control = control
         self.authorized, data = self.authorize(data)
-        if self.authorized:
-            self.downlink = int(data[:3]) if data[:3].isdigit() else 1 # "020" == 20%
+        if not self.authorized:
+            return
+        self.downlink = int(data[:3]) if data[:3].isdigit() else 1
+        self.timer = resettableTimer(30, self.handle_close)
 
     def authorize(self, data):
         """ Check the passphrases """
         auth, remaining = data[:len(self.control.secret)], data[len(self.control.secret):]
         if auth != self.control.secret:
-            self.control.loadbalancer.send('403 unauthorized!', self.addr)
+            #self.control.loadbalancer.send('403 unauthorized!', self.addr)
             return False, remaining
         return True, remaining
 
     def handle_close(self):
-        self.close()
-
-    def close(self):
-        self.control.loadbalancer_pool_addrs.remove(self.addr)
-        self.control.loadbalancer_pool.remove(self)
-
+        self.control.loadbalancing_pool.remove(self)
+        if self.timer.is_running:
+            self.timer.stop()
+        
+    def send(self, packet, destination=None):
+        """ Send via loadbalancer """
+        # Destination-argument is for compatebility with the LoadbalancerClient
+        self.control.loadbalancer.send(packet, self.addr)
 
 class LoadbalancerControl(asyncore.file_dispatcher):
     """ Base Class of the Loadbalancing. Handles the tun/tap-device and spawns loadbalancers."""
@@ -278,11 +323,13 @@ class LoadbalancerControl(asyncore.file_dispatcher):
         self.secret = options.get('secret','')
         self.port = options.get('port',11111)
         self.buffer = []
-        self.loadbalancer_pool = []
+        self.loadbalancing_pool = []
 
         _tap = options.get('tap', True)
         _name = options.get('name', '')
+        _mtu = 1496-28-200
         self.dev = TapDevice(tap=_tap, name=_name)
+        self.dev.ifconfig(mtu=_mtu)
 
         asyncore.file_dispatcher.__init__(self, self.dev.getFD())
 
@@ -327,16 +374,16 @@ class LoadbalancerControl(asyncore.file_dispatcher):
             if len(self.buffer) == 0:
                 return
             packet = self.buffer.pop()
-            logging.debug('Writing {}byte packet to device'.format(len(packet)))
+            logging.debug('\tWriting {}byte packet to device'.format(len(packet)))
             self.dev.write(packet)
         except OSError as e:
             if e.errno == 22:
                 # Invalid packet
-                logging.debug('Failed to write invalid packet "{}"'.format(packet))
+                logging.debug('\tFailed to write invalid packet "{}"'.format(packet))
             else:
-                logging.exception('Writing "{}" to device caused exception: {}'.format(packet, e.strerror))
+                logging.exception('\tWriting "{}" to device caused exception: {}'.format(packet, e.strerror))
         except Exception as e:
-            logging.exception('Writing "{}" to device caused exception: {}'.format(packet, e.strerror))
+            logging.exception('\tWriting "{}" to device caused exception: {}'.format(packet, e.strerror))
 
     def write(self, packet):
         """ Store received packets from loadbalancers to local buffer """
@@ -351,31 +398,36 @@ class LoadbalancerControl(asyncore.file_dispatcher):
 
     def balance_data_round_robin(self, packet):
         """ Use Round Robin to distribute each packet via revolving loadbalancers """
-        if len(self.loadbalancer_pool) == 0:
+        if len(self.loadbalancing_pool) == 0:
             return
         
-#        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancer_pool[self.rr])))
-        self.loadbalancer_pool[self.rr].send(packet, self.destination)
-        self.rr = self.rr+1 if self.rr < len(self.loadbalancer_pool)-1 else 0
+#        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancing_pool[self.rr])))
+        try:
+            self.loadbalancing_pool[self.rr].send(packet, self.destination)
+        except Exception as e:
+            raise e
+            logging.exception('Error {} while sending {}b data via Loadbalancer_{}'.format(e.strerror, len(packet), self.rr))
+            
+        self.rr = self.rr+1 if self.rr < len(self.loadbalancing_pool)-1 else 0
 
     def quit(self):
         """ Gracefully close all loadbalancers and self """
         self.shutdown = True
         logging.debug('Closing loadbalancers...')
         # Loadbalancer modifies the pool in close, so make a static list
-        for s in list(self.loadbalancer_pool):
-            s.handle_close()
+        for item in list(self.loadbalancing_pool):
+            item.handle_close()
 
-        if self.loadbalancer_pool:
+        if len(self.loadbalancing_pool) > 0:
             logging.debug('Waiting for loadbalancers to close...')
             for i in range(5):
-                if len(self.loadbalancer_pool) == 0:
+                if len(self.loadbalancing_pool) == 0:
                     break
                 time.sleep(1)
             else:
-                for s in self.loadbalancer_pool:
-                    s.close()
-                    del s
+                for item in self.loadbalancing_pool:
+                    item.handle_close()
+                    del item
 
         logging.debug('Closing self...')
         self.dev.close()
@@ -406,26 +458,14 @@ class LoadbalancerClientControl(LoadbalancerControl):
     def assign_loadbalancer_to_specs(self, routing_specs):
         """ Build a loadbalancer, which binds to the specified interface address """
         logging.debug('Building Loadbalancer for {}'.format(routing_specs))
-        balancer = LoadbalancerClient(self, routing_specs)
-        self.loadbalancer_pool.append(balancer)
+        self.loadbalancing_pool.append(LoadbalancerClient(self, routing_specs))
 
 class LoadbalancerServerControl(LoadbalancerControl):
+    destination = None
     def __init__(self, options):
         LoadbalancerControl.__init__(self, options)
 
         self.loadbalancer = LoadbalancerServer(self)
-        self.loadbalancer_pool_addrs = []
-
-    def balance_data_round_robin(self, packet):
-        """ Use Round Robin to distribute each packet via revolving loadbalancers """
-        if len(self.loadbalancer_pool) == 0:
-            return
-
-#        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(self.loadbalancer_pool[self.rr])))
-        current_target = self.loadbalancer_pool[self.rr]
-        self.loadbalancer.send(packet, current_target.addr)
-        self.rr = self.rr+1 if self.rr < len(self.loadbalancer_pool)-1 else 0
-
 
 if __name__ == '__main__':
     import argparse
@@ -445,7 +485,7 @@ if __name__ == '__main__':
     routings = p['routing']
     options = {'port':p['port'], 'secret':p['secret'], 'name':p['name'], 'tap':not p['tun'], 'tunnel_address':p['address']}
 
-    logging.basicConfig(format='%(levelname)s:%(funcName)s\t\t%(message)s', level=logging.DEBUG)
+    logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%H:%M:%S', level=logging.ERROR)
 
     if destination:
         loadbalancer = LoadbalancerClientControl(destination, routings, options)
