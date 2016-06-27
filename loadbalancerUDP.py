@@ -6,7 +6,7 @@ import socket, threading
 import asyncore, sys
 import logging
 
-from pytap import TapDevice
+from ether2any.pytap import TapDevice
 import netifaces
 
 import re
