@@ -50,17 +50,22 @@ class dispatcher_with_addr(asyncore.dispatcher):
 
     recvfrom is only used by the server to dynamically adapt to new loadbalancer-clients
     sendto is used by both, since it's udp"""
-    out_buffer = []
-
+    
+    _repr = ''
+    weight = 1
+    
     def __init__(self, sock, control):
         asyncore.dispatcher.__init__(self, sock)
         if self.socket:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             self.set_reuse_addr()
 
         self.control = control
         self.port = control.port
+        self.out_buffer = []
+        if not self._repr:
+            self._repr = '<unbound>'
 
     def timeout_close(self):
         logging.info('{} exited due to not receiving data for {} seconds'.format(repr(self), self.timeout))
@@ -68,11 +73,13 @@ class dispatcher_with_addr(asyncore.dispatcher):
 
     def writable(self):
         return len(self.out_buffer) > 0
-
-    def initiate_send(self):
-        """ Get a packet from the buffer and write it to the addres """
-        packet, addr = self.out_buffer.pop() if len(self.out_buffer) else ('',())
+    
+    def handle_write(self):
+        """ Get a packet from the buffer and write it to the address """
+        packet, addr = self.out_buffer.pop() if self.out_buffer else ('',())
         logging.debug('Sending {}b packet  to {}'.format(len(packet), repr(addr)))
+        if len(self.out_buffer) > 10:
+            print len(self.out_buffer)
         while len(packet) > 0:
             num_sent = self.sendto(packet, addr)
             logging.debug('\t {}b sent'.format(num_sent))
@@ -83,7 +90,7 @@ class dispatcher_with_addr(asyncore.dispatcher):
     def send(self, data, addr):
         """ Append to buffer and start sending """ 
         self.out_buffer.append((data, addr))
-        self.initiate_send()
+        #self.initiate_send()
 
     def sendto(self, data, addr):
         """ Wrapper for exceptions around sendto """
@@ -101,7 +108,7 @@ class dispatcher_with_addr(asyncore.dispatcher):
 
     def handle_read(self):
         """ Read a datagram and write to the tun/tap device """
-        data = self.recv(8192)
+        data = self.recv(4096)
         if data:
             logging.debug('Reading {}b packet from loadbalancing'.format(len(data)))
             self.timer.reset()
@@ -127,11 +134,8 @@ class dispatcher_with_addr(asyncore.dispatcher):
                 raise
 
     def __repr__(self):
-        try:
-            return 'Loadbalancer:{}'.format(self.addr[-1])
-        except:
-            return 'Loadbalancer:<unbound>'
-
+        return 'Loadbalancer:{}'.format(self._repr)
+        
 
 class LoadbalancerClient(dispatcher_with_addr):
     """ LoadbalancerClients get spawned to transmit data from the tun/tap device to the server
@@ -139,7 +143,6 @@ class LoadbalancerClient(dispatcher_with_addr):
     Their focus is to take care that their traffic is routable via 
     different paths (binding to specific interfaces/ip/ports) and
     authenticating themselves to the server."""
-    out_buffer = []
 
     def __init__(self, control, routing_spec):
         sock = self.parse_routing_spec(routing_spec)
@@ -166,16 +169,16 @@ class LoadbalancerClient(dispatcher_with_addr):
             weighted balancing
         """
 
-        if '$' in routing_spec:
+        if '=' in routing_spec:
             try:
-                weights = routing_spec.rsplit('$', 1)
+                routing_spec, weights = routing_spec.rsplit('=', 1)
                 downlink, uplink = weights.split(':')
-                self.weight_downlink, self.weight_uplink = int(downlink), int(uplink)
+                self.weight_downlink, self.weight = int(downlink), int(uplink)
+                
             except Exception as e:
                 logging.exception('Error parsing weight specifications "{}": {}'.format(weights, e.strerror))
         else:
             self.weight_downlink, self.weight_uplink = 1,1
-
 
         # Test if there is an interface with that name
         interfaces = netifaces.interfaces()
@@ -196,21 +199,15 @@ class LoadbalancerClient(dispatcher_with_addr):
                     if re.match(regex_ipv4, interface_name):
                         ip_addr = interface_name
                     else:
-                        ip_addr = get_ip_address(interface_name, self.socket)
+                        ip_addr = self.get_ip_addr_from_interface(interface_name)
         else:
             # ':' is not there or it is a subinterface/strange-name
             port = 0
             if re.match(regex_ipv4, routing_spec):
                 ip_addr = routing_spec
             else:
-                if_ = netifaces.ifaddresses(routing_spec)
-                # Find first address we can find (either v4 or v6)
-                for addr_family,addrs in if_.items():
-                    for addr in addrs:
-                        if 'addr' in addr:
-                            ip_addr = addr['addr']
-                            break
-                else:
+                ip_addr = self.get_ip_addr_from_interface(routing_spec)
+                if not ip_addr:
                     logging.error('Cannot bind to specified interface "{}", has no address!'.format(routing_spec))
                     raise socket.error()
                         
@@ -221,8 +218,23 @@ class LoadbalancerClient(dispatcher_with_addr):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         self._addr = (ip_addr, port)
+        self._repr = '{}:{}'.format(ip_addr, port)
 
         return sock
+    
+    def get_ip_addr_from_interface(self, interface):
+        try:
+            if_ = netifaces.ifaddresses(interface)
+        except:
+            return
+        
+        # Find first address we can find (either v4 or v6)
+        for addr_ip4 in if_.get(2,{}):
+            if 'addr' in addr_ip4:
+                return addr_ip4['addr']
+        for addr_ip6 in if_.get(10,{}):
+            if 'addr' in addr_ip6:
+                return addr_ip6['addr']
 
     def loadbalancer_bind(self):
         """ bind to the interface and the specified port (or random) """
@@ -251,14 +263,15 @@ class LoadbalancerServer(dispatcher_with_addr):
         dispatcher_with_addr.__init__(self, sock, control)
 
         self.bind(('0.0.0.0', control.port))
-        logging.debug('Waiting for clients on {}:{}'.format(*self.socket.getsockname()))
+        self._repr = '{}:{}'.format(*self.addr)
+        logging.debug('Waiting for clients on {}'.format(self._repr))
 
 
     def handle_read(self):
         """ Read received data and write to tun/tap device.
 
         If the source of the data is unknown, create a Client for it, if authorization succeeds"""
-        data, addr = self.recvfrom(8192)
+        data, addr = self.recvfrom(4096)
         if not data:
             return
         
@@ -293,7 +306,7 @@ class Client():
         self.authorized, data = self.authorize(data)
         if not self.authorized:
             return
-        self.downlink = int(data[:3]) if data[:3].isdigit() else 1
+        self.weight = int(data[:3]) if data[:3].isdigit() else 1
         self.timer = resettableTimer(30, self.handle_close)
 
     def authorize(self, data):
@@ -313,18 +326,27 @@ class Client():
         """ Send via loadbalancer """
         # Destination-argument is for compatebility with the LoadbalancerClient
         self.control.loadbalancer.send(packet, self.addr)
+        
+    def __repr__(self):
+        return "Client:{}:{}".format(*self.addr)
 
 class LoadbalancerControl(asyncore.file_dispatcher):
     """ Base Class of the Loadbalancing. Handles the tun/tap-device and spawns loadbalancers."""
-    shutdown = False    # Loadbalancers shouldn't reconnect
-    rr = 0              # RoundRobin iterator counter
-
+    
     def __init__(self, options={}):
-        self.secret = options.get('secret','')
-        self.port = options.get('port',11111)
+        self.shutdown = False           # Loadbalancers shouldn't reconnect
         self.buffer = []
         self.loadbalancing_pool = []
-
+        self.rr = 0                     # RoundRobin iterator counter
+        self.weighted_rr_queue = []     # Weighted RoundRobin queue
+        
+        self.secret = options.get('secret','')
+        self.port = options.get('port',11111)
+        mode = options.get('mode','rr')
+        if mode not in self.available_modes.keys():
+            logging.error('Unknown Mode "{}"!'.format(mode))
+        self.balancing_mode = self.available_modes.get(mode, 'rr')
+        
         _tap = options.get('tap', True)
         _name = options.get('name', '')
         _mtu = 1496-28-200
@@ -394,7 +416,7 @@ class LoadbalancerControl(asyncore.file_dispatcher):
     def handle_read_event(self):
         """ Balance received packets to loadbalancers """
         packet = self.dev.read()
-        self.balance_data_round_robin(packet)
+        self.balancing_mode(self, packet)
 
     def balance_data_round_robin(self, packet):
         """ Use Round Robin to distribute each packet via revolving loadbalancers """
@@ -410,6 +432,31 @@ class LoadbalancerControl(asyncore.file_dispatcher):
             
         self.rr = self.rr+1 if self.rr < len(self.loadbalancing_pool)-1 else 0
 
+    def balance_data_weighted_round_robin(self, packet):
+        """ Use Round Robin to distribute each packet via revolving loadbalancers """
+        if len(self.loadbalancing_pool) == 0:
+            return
+        
+        if len(self.weighted_rr_queue) == 0:
+            for lb in self.loadbalancing_pool:
+                for _ in range(lb.weight):
+                    self.weighted_rr_queue.append(lb)
+                    
+        current = self.weighted_rr_queue.pop(0)
+        logging.debug('Sending {}byte packet via {}'.format(len(packet), repr(current)))
+        
+        try:
+            current.send(packet, self.destination)
+        except Exception as e:
+            logging.exception('Error {} while sending {}b data via Loadbalancer_{}'.format(e.strerror, len(packet), current))
+            
+        if len(self.weighted_rr_queue) > 0 and self.weighted_rr_queue[0] != current:
+            for i in range(current.weight):
+                self.weighted_rr_queue.append(current)
+                
+    available_modes = {'rr':balance_data_round_robin,
+                       'wrr':balance_data_weighted_round_robin,
+                      }
     def quit(self):
         """ Gracefully close all loadbalancers and self """
         self.shutdown = True
@@ -471,21 +518,25 @@ if __name__ == '__main__':
     import argparse
     argparser = argparse.ArgumentParser(description="Creates a tun/tap device, which sends packets via multiple interfaces to a corresponding server. This is an implementation of link aggregation / bonding, except with a dynamic distribution algorithm, allowing for example for weighted interfaces.", epilog="Created and Maintained by Kai Sisterhenn under GPLv3, sistason@sistason.de")
     argparser.add_argument('--remote', '-r', help='Run as client, connecting to specified destination IP')
-    argparser.add_argument('routing', nargs='*', help='Bind to specific sources by setting [interface/IPaddress][:port] and add [$downlink:uplink] to balance the traffic (client option).')
+    argparser.add_argument('routing', nargs='*', help='Bind to specific sources by setting [interface/IPaddress][:port] and add [=downlink:uplink] to balance the traffic (client option).')
     argparser.add_argument('--port', '-p', type=int, default=11111, help='Set the port on which to connect to / listen on')
     # TODO: to two-factor-authentication
     argparser.add_argument('--secret','-s',  help='Set a passphrase to authenticate connecting clients. Will stop accidental usage by other programs, but is transmitted trivially in the clear, so don\'t think it does security.')
     argparser.add_argument('--name', '-n',  help='Name of the tap/tun device', default='')
     argparser.add_argument('--tun', '-t',  type=bool, help='Use a tun device instead of a tap device', default=False)
     argparser.add_argument('--address', '-a', help='Address of the tun/tap device')
+    argparser.add_argument('--mode', '-m', choices=LoadbalancerControl.available_modes.keys(), default='rr', help='Balancing Mode')
+    argparser.add_argument('--verbose', '-v', action='count', help='Be more verbose', default=0)
+    argparser.add_argument('--quiet', '-q', action='count', help='Be less verbose', default=0)
 
     p=vars(argparser.parse_args())
     
     destination = p['remote']
     routings = p['routing']
-    options = {'port':p['port'], 'secret':p['secret'], 'name':p['name'], 'tap':not p['tun'], 'tunnel_address':p['address']}
+    options = {'port':p['port'], 'secret':p['secret'], 'name':p['name'], 'tap':not p['tun'], 'tunnel_address':p['address'], 'mode':p['mode']}
 
-    logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%H:%M:%S', level=logging.ERROR)
+    loglevel_ = 20 - p['verbose']*10 + p['quiet']*10
+    logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%H:%M:%S', level=loglevel_)
 
     if destination:
         loadbalancer = LoadbalancerClientControl(destination, routings, options)
